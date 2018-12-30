@@ -1,0 +1,322 @@
+
+# load libraries ===============================================
+
+library(tidyverse)
+library(xgboost)
+library(data.table)
+library(e1071)
+
+# read data ====================================================
+
+data.test <- read_csv('data/test.csv')
+data.train <- read_csv('data/train.csv')
+
+# find missing values ==========================================
+data.missing <- (
+    data.test %>%
+    summarise_all(funs(sum(is.na(.)))) %>%
+    gather() %>%
+    rename(VariableName = key, Count=value) %>%
+    mutate(Info = 'Missing', Source='test')
+  ) %>%
+  bind_rows(
+    data.train %>%
+      summarise_all(funs(sum(is.na(.)))) %>%
+      gather() %>%
+      rename(VariableName = key, Count=value) %>%
+      mutate(Info = 'Missing', Source='train')
+  )
+
+ggplot(data = data.missing, 
+       aes(x = VariableName, y = Count, fill = Source)) +
+  geom_bar(stat="identity") +
+  geom_text(aes(label = Count), vjust=0) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+rm(data.missing)
+
+# wrangling ====================================================
+
+# tag origin and merge datasets so we can clean the data
+# fix the missing embarkation record
+# split name into title, surname, forenames
+
+data.full <- (data.train %>% mutate(Source = 'train')) %>%
+  bind_rows((data.test) %>% mutate(Source = 'test')) %>%
+  # 2 records have no Embarkation, looking by eye assign them to Southampton
+  mutate(Embarked = if_else(PassengerId %in% c(62,830), 'S', Embarked)) %>%
+  # One of the Cabins has bad data, NB use base ifelse here
+  mutate(Cabin = ifelse(Cabin == 'D', NA, Cabin)) %>%
+  # separate the Surname delimited by ,
+  separate(Name, c("Surname", "RestName"), ",") %>%
+  # trim whitespace
+  mutate(RestName = trimws(RestName)) %>%
+  # separate the Title from the rest of the name
+  separate(RestName, c("Title", "ForeNames"), "\\.", extra = "merge") %>%
+  # there's one Ms, assume thats a Miss
+  mutate(Title = if_else(Title == 'Ms', 'Miss', Title)) %>%
+  mutate(Family = if_else(SibSp > 0 | Parch >0, 1, 0))
+
+# sole traveller ===============================================
+# categorise by whether they were travelling in a group 
+# hypothesis is that groups help each other
+# either because they said they were in a family (SibSp, Parch)
+# because they shared a cabin
+# because they shared a ticket
+
+# get the shared cabins and allocate a group number
+data.cabin <- data.full %>% 
+  filter(!is.na(Cabin)) %>% 
+  count(Cabin) %>% 
+  filter(n > 1) %>% 
+  rename(CabinCount = n) %>% 
+  mutate(CabinGroup = row_number())
+
+maxgroup <- max(data.cabin$CabinGroup)
+
+data.full <- data.full %>%
+  left_join(data.cabin)
+
+# get common tickets
+data.ticket <- data.full %>% 
+  filter(!is.na(Ticket)) %>% 
+  count(Ticket) %>% 
+  filter(n > 1) %>% 
+  rename(TicketCount = n) %>%
+  mutate(TicketGroup = maxgroup + row_number())
+
+maxgroup <- max(data.ticket$TicketGroup)
+
+data.full <- data.full %>%
+  left_join(data.ticket)
+
+# travel with family but not sharing ticket or cabin
+data.surname <- data.full %>%
+  filter(Family == 1 & (is.na(CabinGroup) & is.na(TicketGroup))) %>%
+  count(Surname) %>%
+  filter(n > 1) %>%
+  rename(SurnameCount = n) %>%
+  mutate(SurnameGroup = maxgroup + row_number())
+
+data.surnamex <- data.full %>%
+  filter(Family == 1 & (is.na(CabinGroup) & is.na(TicketGroup))) %>%
+  filter(Surname %in% data.surname$Surname) %>%
+  left_join(data.surname) %>%
+  select(PassengerId, SurnameGroup)
+  
+data.full <- data.full %>%
+  left_join(data.surnamex)
+
+rm(data.cabin, data.ticket, data.surname, data.surnamex, data.x, data.fam)  
+
+# change NA to zero
+data.full <- data.full %>%
+  mutate(CabinCount = coalesce(CabinCount, as.integer(0)),
+         CabinGroup = coalesce(CabinGroup, as.integer(0)),
+         TicketCount = coalesce(TicketCount, as.integer(0)),
+         TicketGroup = coalesce(TicketGroup, as.integer(0)),
+         SurnameGroup = coalesce(SurnameGroup, as.integer(0)))
+
+data.full <- data.full %>%
+  mutate(Sharing = if_else(Family == 0 & (CabinGroup > 0 | TicketGroup > 0 | SurnameGroup > 0), 1, 0))
+
+# Age is the main variable we need to impute ===================
+# assume there may be variations between Class, Where they embarked, and we
+# can use the Title of their name. Find the median Ages of each group and
+# use that to fill in NAs 
+
+# separate the surname, title and forenames
+data.agemodel <- data.full %>%
+  # Make a group 
+  mutate(grp = paste(Embarked, Pclass, Title)) %>%
+  select(grp, Age) %>%
+  filter(!is.na(Age)) %>%
+  group_by(grp) %>%
+  summarise(n(), min(Age), max(Age), mean(Age), med = median(Age))
+
+# fill in missing ages from nearest neighbour median
+data.full <- data.full %>%
+  mutate(grp = paste(Embarked, Pclass, Title)) %>%
+  mutate(AgeImputed = if_else(is.na(Age),1,0)) %>%
+  left_join(data.agemodel) %>%
+  mutate(Age = if_else(is.na(Age), med, Age)) 
+
+rm(data.agemodel)
+
+# model data ===================================================
+
+# best data so far
+data.model <- data.full %>%
+  select(Source, Survived, 
+         Sex, Age, Family, Sharing,
+         Pclass, Embarked)
+
+# eda ==========================================================
+
+data.plot.input <- data.model %>%
+  filter(Source == 'train')
+
+# get crosstab figures
+data.plot <- data.plot.input %>%
+  group_by(Pclass) %>%
+  count(Survived) %>%
+  mutate(pcent = round(n / sum(n) * 100, 1)) %>%
+  mutate(Label = paste0(pcent,'%')) %>%
+  mutate(Survived = as.character(Survived)) %>%
+  select(Pclass, Survived, pcent, Label)
+  
+# column totals
+data.tot <- count(data.plot.input, Pclass) %>%
+  mutate(Survived='Total', pcent = n) %>%
+  mutate(Label = as.character(pcent)) %>%
+  select(Pclass, Survived, pcent, Label)
+
+# merge
+data.plot <- data.plot %>%
+  bind_rows(.,data.tot)
+
+data.plot$Survived <- factor(data.plot$Survived, levels = c('0','1','Total'))
+
+# plot
+ggplot(data.plot, aes(x = Pclass, y = Survived, fill = pcent)) +
+  # tile with black contour
+  geom_tile(color="black") + 
+  # B&W theme, no grey background
+  theme_bw() + 
+  # square tiles
+  coord_equal() + 
+  # Green color theme for `fill`
+  scale_fill_distiller(palette="Greens", direction=1) + 
+  # printing values in black
+  geom_text(aes(label = Label), color="black") +
+  # removing legend for `fill` since we're already printing values
+  guides(fill=F) +
+  # since there is no legend, adding a title
+  labs(title = "Survived by pclass")
+
+rm(data.plot, data.plot.input)
+
+# xgboost ======================================================
+
+# remove Fare as it doesn't seem logical from the values, 
+# and Cabin, Ticket, PassengerId add nothing
+
+# get data in the correct format
+# data must be a sparse matrix with no nas
+data.train.model <- data.model %>%
+  filter(Source == 'train') %>%
+  select(-Source)
+
+dim(data.train.model)
+sparse_x <- Matrix::sparse.model.matrix(Survived~.-1, 
+                                        data = data.train.model)
+
+dim(sparse_x)
+# targets must be numeric
+targets_x <- data.train %>%
+  select(Survived) %>%
+  pull()
+
+data.test.model <- data.model %>%
+  filter(Source == 'test') %>%
+  select(-Source, -Survived)
+
+sparse_y <- Matrix::sparse.model.matrix(~.-1, 
+                                        data = data.test.model)
+
+
+# simple model ------------------------------------------
+bstSparse1 <- xgboost(data = sparse_x, 
+                     label = targets_x, 
+                     max.depth = 2, 
+                     eta = 1, 
+                     nthread = 2, 
+                     nrounds = 2, 
+                     objective = "binary:logistic")
+
+importance.xgb.1 <- xgb.importance(feature_names = sparse_x@Dimnames[[2]], 
+                             model = bstSparse1)
+
+xgb.plot.importance(importance_matrix = importance.xgb.1)
+xgb.plot.tree(model = bstSparse1)
+
+# predict
+pred1 <- predict(bstSparse1, sparse_x)
+
+
+#another set of hyperparameters
+bstSparse2 <- xgboost(data = sparse_x, label = targets_x, 
+                      max.depth = 15, eta = 1, nthread = 2, 
+                      nround = 30, objective = "binary:logistic",
+                      min_child_weight = 50)
+importance.xgb.2 <- xgb.importance(feature_names = sparse_x@Dimnames[[2]], 
+                                   model = bstSparse2)
+
+xgb.plot.importance(importance_matrix = importance.xgb.2)
+xgb.plot.tree(model = bstSparse2)
+# predict
+pred2 <- predict(bstSparse2, sparse_x)
+
+# and another
+#another set of hyperparameters
+bstSparse3 <- xgboost(data = sparse_x, label = targets_x, 
+                      max.depth = 20, eta = 1, nthread = 2, 
+                      nround = 50, objective = "binary:logistic",
+                      min_child_weight = 50)
+importance.xgb.3 <- xgb.importance(feature_names = sparse_x@Dimnames[[2]], 
+                                   model = bstSparse3)
+
+# predict
+pred3 <- predict(bstSparse3, sparse_x)
+
+# compare
+pred <- data.frame(pred1, pred2, pred3) %>%
+  mutate(pred1B = if_else(pred1 < 0.5, 0, 1),
+         pred2B = if_else(pred2 < 0.5, 0, 1),
+         pred3B = if_else(pred3 < 0.5, 0, 1)) 
+
+ggplot(pred, aes(pred1, pred2, colour=pred1B)) +
+  geom_point()
+
+ggplot(pred, aes(pred1, pred3, colour=pred1B)) +
+  geom_point()
+
+# random forest ====================================
+
+library('randomForest')
+
+set.seed(123)
+
+fit_rf <- randomForest(factor(Survived) ~ Age ,
+                       data = data.train.model)
+
+
+# predicted result of regression
+rf.fitted = predict(fit_rf)
+ans_rf = rep(NA,891)
+for(i in 1:891){
+  ans_rf[i] = as.integer(rf.fitted[[i]]) - 1
+}
+# check result
+mean(ans_rf == data.train.model$Survived)
+table(ans_rf)
+
+# roc ==============================================
+source('R_TITANIC_ROC.R')
+
+predictions <- data.frame(survived = data.train$Survived, pred = pred$pred3)
+predictions <- data.frame(survived = data.train$Survived, pred = as.numeric(ans_rf))
+
+threshold <- 0.6
+plot_pred_type_distribution(predictions, threshold)
+
+roc <- calculate_roc(predictions, 1, 2, n = 100)
+
+plot_roc(roc, threshold, 1, 2)
+
+# # svm ==============================================
+# 
+# model.svm <- svm(sparse_x, targets_x)
+# pred.svm <- predict(model.svm, sparse_x,decision.values = TRUE)
+# 
+# table(pred.svm, targets_x)
